@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>AI Facial Expression Recognition</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            background: #111;
+            color: white;
+            display: flex;
+            justify-content: center;
+            padding: 25px 12px;
+        }
+
+        .app {
+            width: 100%;
+            max-width: 1000px;
+        }
+
+        h1 {
+            text-align: center;
+            margin: 5px 0 8px;
+            font-size: 32px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #aaa;
+            margin-bottom: 22px;
+        }
+
+        .camera-container {
+            position: relative;
+            width: 100%;
+            background: #222;
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 0 30px rgba(0, 0, 0, 0.6);
+        }
+
+        video {
+            width: 100%;
+            display: block;
+            background: #000;
+        }
+
+        canvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            margin-top: 18px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            border: 0;
+            border-radius: 8px;
+            padding: 12px 22px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        #startButton {
+            background: #2ecc71;
+            color: #111;
+        }
+
+        #stopButton {
+            background: #e74c3c;
+            color: white;
+        }
+
+        button:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        .status {
+            margin: 18px auto 0;
+            padding: 11px 16px;
+            max-width: 700px;
+            border-radius: 8px;
+            background: #222;
+            color: #aaa;
+            text-align: center;
+        }
+
+        .stats {
+            display: flex;
+            justify-content: center;
+            gap: 25px;
+            margin-top: 12px;
+            color: #bbb;
+            font-size: 14px;
+            flex-wrap: wrap;
+        }
+
+        @media (max-width: 700px) {
+            h1 {
+                font-size: 24px;
+            }
+
+            body {
+                padding-top: 15px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="app">
+
+    <h1>AI Facial Expression Recognition</h1>
+
+    <div class="subtitle">
+        ViT Facial Expression Recognition
+    </div>
+
+    <div class="camera-container">
+        <video id="camera" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+    </div>
+
+    <div class="controls">
+        <button id="startButton">Start Camera</button>
+        <button id="stopButton" disabled>Stop Camera</button>
+    </div>
+
+    <div class="status" id="status">
+        Camera is stopped.
+    </div>
+
+    <div class="stats">
+        <span id="faceCount">Faces: 0</span>
+        <span id="aiStatus">AI: Idle</span>
+    </div>
+
+    <canvas id="captureCanvas" style="display:none;"></canvas>
+
+</div>
+
+<script>
+    const video = document.getElementById("camera");
+    const overlay = document.getElementById("overlay");
+    const captureCanvas = document.getElementById("captureCanvas");
+
+    const startButton = document.getElementById("startButton");
+    const stopButton = document.getElementById("stopButton");
+
+    const statusText = document.getElementById("status");
+    const faceCountText = document.getElementById("faceCount");
+    const aiStatusText = document.getElementById("aiStatus");
+
+    let stream = null;
+    let running = false;
+    let requestInProgress = false;
+
+    // Send an AI frame about 5 times per second.
+    // The video itself stays at the browser's normal camera FPS.
+    const INFERENCE_INTERVAL = 200;
+
+    async function startCamera() {
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    facingMode: "user",
+                    width: { ideal: 640 },
+                    height: { ideal: 480 }
+                },
+                audio: false
+            });
+
+            video.srcObject = stream;
+
+            await video.play();
+
+            running = true;
+
+            startButton.disabled = true;
+            stopButton.disabled = false;
+
+            statusText.textContent =
+                "Camera running. Allow camera permission if requested.";
+
+            startInferenceLoop();
+
+        } catch (error) {
+            console.error(error);
+
+            statusText.textContent =
+                "Could not access camera: " + error.message;
+        }
+    }
+
+    function stopCamera() {
+        running = false;
+
+        if (stream) {
+            stream.getTracks().forEach(track => track.stop());
+            stream = null;
+        }
+
+        video.srcObject = null;
+
+        clearOverlay();
+
+        startButton.disabled = false;
+        stopButton.disabled = true;
+
+        statusText.textContent = "Camera is stopped.";
+        aiStatusText.textContent = "AI: Idle";
+        faceCountText.textContent = "Faces: 0";
+    }
+
+    async function startInferenceLoop() {
+        while (running) {
+
+            if (!requestInProgress &&
+                video.readyState >= 2 &&
+                video.videoWidth > 0 &&
+                video.videoHeight > 0) {
+
+                await sendFrameForPrediction();
+            }
+
+            await new Promise(resolve =>
+                setTimeout(resolve, INFERENCE_INTERVAL)
+            );
+        }
+    }
+
+    async function sendFrameForPrediction() {
+        requestInProgress = true;
+        aiStatusText.textContent = "AI: Processing...";
+
+        try {
+            const width = Math.min(video.videoWidth, 640);
+            const scale = width / video.videoWidth;
+            const height = Math.round(video.videoHeight * scale);
+
+            captureCanvas.width = width;
+            captureCanvas.height = height;
+
+            const ctx = captureCanvas.getContext("2d");
+
+            // Mirror the image so it matches the displayed camera.
+            ctx.save();
+            ctx.translate(width, 0);
+            ctx.scale(-1, 1);
+
+            ctx.drawImage(
+                video,
+                0,
+                0,
+                width,
+                height
+            );
+
+            ctx.restore();
+
+            const blob = await new Promise(resolve =>
+                captureCanvas.toBlob(
+                    resolve,
+                    "image/jpeg",
+                    0.70
+                )
+            );
+
+            if (!blob) {
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append("frame", blob, "camera.jpg");
+
+            const response = await fetch("/predict", {
+                method: "POST",
+                body: formData
+            });
+
+            if (!response.ok) {
+                throw new Error("Server returned " + response.status);
+            }
+
+            const data = await response.json();
+
+            drawResults(
+                data.faces || [],
+                width,
+                height
+            );
+
+            faceCountText.textContent =
+                "Faces: " + (data.faces || []).length;
+
+            aiStatusText.textContent =
+                "AI: Active";
+
+        } catch (error) {
+            console.error(error);
+            aiStatusText.textContent = "AI: Error";
+            statusText.textContent =
+                "Prediction error: " + error.message;
+        } finally {
+            requestInProgress = false;
+        }
+    }
+
+    function drawResults(faces, frameWidth, frameHeight) {
+        const rect = video.getBoundingClientRect();
+
+        overlay.width = frameWidth;
+        overlay.height = frameHeight;
+
+        const ctx = overlay.getContext("2d");
+
+        ctx.clearRect(
+            0,
+            0,
+            overlay.width,
+            overlay.height
+        );
+
+        for (const face of faces) {
+
+            // Coordinates are from the mirrored camera frame.
+            const x = face.x;
+            const y = face.y;
+            const w = face.w;
+            const h = face.h;
+
+            ctx.strokeStyle = "#00ff66";
+            ctx.lineWidth = Math.max(2, frameWidth / 320);
+
+            ctx.strokeRect(
+                x,
+                y,
+                w,
+                h
+            );
+
+            const text =
+                face.emotion.toUpperCase() +
+                ": " +
+                face.confidence +
+                "%";
+
+            ctx.font = "bold 16px Arial";
+
+            const textWidth =
+                ctx.measureText(text).width;
+
+            const labelHeight = 28;
+
+            const labelY =
+                Math.max(0, y - labelHeight);
+
+            ctx.fillStyle = "#00ff66";
+
+            ctx.fillRect(
+                x,
+                labelY,
+                textWidth + 12,
+                labelHeight
+            );
+
+            ctx.fillStyle = "#000";
+
+            ctx.fillText(
+                text,
+                x + 6,
+                labelY + 19
+            );
+        }
+    }
+
+    function clearOverlay() {
+        const ctx = overlay.getContext("2d");
+
+        ctx.clearRect(
+            0,
+            0,
+            overlay.width,
+            overlay.height
+        );
+    }
+
+    startButton.addEventListener(
+        "click",
+        startCamera
+    );
+
+    stopButton.addEventListener(
+        "click",
+        stopCamera
+    );
+
+    window.addEventListener(
+        "beforeunload",
+        stopCamera
+    );
+</script>
+
+</body>
+</html>
