@@ -1,385 +1,301 @@
-import os
-import io
-import urllib.request
-
+import streamlit as st
 import cv2
-import numpy as np
 import torch
+import torch.nn.functional as F
+import numpy as np
 from PIL import Image
-from flask import Flask, render_template, request, jsonify
 from transformers import ViTImageProcessor, ViTForImageClassification
 
+# =============================================================
+# STREAMLIT PAGE CONFIGURATION
+# =============================================================
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+st.set_page_config(
+    page_title="Facial Expression Recognition",
+    page_icon="😊",
+    layout="wide"
+)
 
 MODEL_NAME = "mo-thecreator/vit-Facial-Expression-Recognition"
 
-MAX_IMAGE_WIDTH = 640
 
-# Minimum time between AI predictions from the browser.
-# 0.20 = approximately 5 predictions per second.
-INFERENCE_INTERVAL = 0.20
+# =============================================================
+# 1. LOAD EMOTION RECOGNITION MODEL
+# =============================================================
 
+@st.cache_resource
+def load_emotion_model():
+    processor = ViTImageProcessor.from_pretrained(MODEL_NAME)
+    model = ViTForImageClassification.from_pretrained(MODEL_NAME)
 
-# ============================================================
-# FLASK
-# ============================================================
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-app = Flask(__name__)
+    model.to(device)
+    model.eval()
 
-
-# ============================================================
-# DEVICE
-# ============================================================
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return processor, model, device
 
 
-# ============================================================
-# LOAD EMOTION MODEL
-# ============================================================
+# =============================================================
+# 2. LOAD FACE DETECTION CASCADE
+# =============================================================
 
-print("Loading ViT emotion model...")
+@st.cache_resource
+def load_face_detector():
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    face_cascade = cv2.CascadeClassifier(cascade_path)
 
-processor = ViTImageProcessor.from_pretrained(MODEL_NAME)
+    if face_cascade.empty():
+        raise RuntimeError("Could not load Haar Cascade.")
 
-model = ViTForImageClassification.from_pretrained(MODEL_NAME)
-
-model.to(DEVICE)
-model.eval()
-
-print(f"Model loaded on: {DEVICE}")
-
-
-# ============================================================
-# LOAD HAAR FACE DETECTOR
-# ============================================================
-
-CASCADE_URL = (
-    "https://raw.githubusercontent.com/opencv/opencv/"
-    "4.x/data/haarcascades/haarcascade_frontalface_default.xml"
-)
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CASCADE_FILE = os.path.join(
-    BASE_DIR,
-    "haarcascade_frontalface_default.xml"
-)
+    return face_cascade
 
 
-if not os.path.exists(CASCADE_FILE):
-    print("Downloading face detector XML...")
+# =============================================================
+# 3. FACE + EMOTION DETECTION
+# =============================================================
 
-    urllib.request.urlretrieve(
-        CASCADE_URL,
-        CASCADE_FILE
+def detect_emotions(image, processor, model, device, face_cascade):
+    # PIL RGB -> OpenCV BGR
+    rgb_image = np.array(image)
+    frame = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+
+    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Detect faces
+    faces = face_cascade.detectMultiScale(
+        gray_frame,
+        scaleFactor=1.2,
+        minNeighbors=5,
+        minSize=(60, 60)
     )
 
+    detections = []
 
-face_cascade = cv2.CascadeClassifier(CASCADE_FILE)
+    for (x, y, w, h) in faces:
 
-if face_cascade.empty():
-    raise RuntimeError("Could not load Haar face detector.")
+        # Crop face
+        face_roi = frame[y:y+h, x:x+w]
 
-print("Face detector loaded successfully.")
+        if face_roi.size == 0:
+            continue
 
+        # BGR -> RGB
+        face_rgb = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
 
-# ============================================================
-# EMOTION PREDICTION
-# ============================================================
+        # Convert to PIL
+        pil_face = Image.fromarray(face_rgb)
 
-def predict_emotions(face_images):
-    """
-    Predict emotions for multiple face images in one batch.
-    """
-
-    if not face_images:
-        return []
-
-    pil_images = []
-
-    for face in face_images:
-
-        rgb_face = cv2.cvtColor(
-            face,
-            cv2.COLOR_BGR2RGB
+        # Preprocess
+        inputs = processor(
+            images=pil_face,
+            return_tensors="pt"
         )
 
-        pil_image = Image.fromarray(rgb_face)
+        inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+        }
 
-        pil_images.append(pil_image)
+        # ViT inference
+        with torch.no_grad():
+            logits = model(**inputs).logits
 
-    inputs = processor(
-        images=pil_images,
-        return_tensors="pt"
-    )
+        # Calculate probabilities
+        probabilities = F.softmax(logits, dim=-1)[0]
 
-    inputs = {
-        key: value.to(DEVICE)
-        for key, value in inputs.items()
-    }
+        pred_idx = torch.argmax(probabilities).item()
 
-    with torch.inference_mode():
+        label = model.config.id2label[pred_idx]
 
-        outputs = model(**inputs)
+        confidence = probabilities[pred_idx].item()
 
-        probabilities = torch.softmax(
-            outputs.logits,
-            dim=-1
+        detections.append(
+            (x, y, w, h, label, confidence)
         )
 
-        confidences, class_ids = torch.max(
-            probabilities,
-            dim=-1
-        )
+    # Draw results
+    for (
+        x,
+        y,
+        w,
+        h,
+        label,
+        confidence
+    ) in detections:
 
-    results = []
-
-    for confidence, class_id in zip(
-        confidences,
-        class_ids
-    ):
-
-        emotion = model.config.id2label[
-            int(class_id)
-        ]
-
-        confidence_value = float(
-            confidence.item()
-        )
-
-        results.append({
-            "emotion": emotion,
-            "confidence": confidence_value
-        })
-
-    return results
-
-
-# ============================================================
-# HOME PAGE
-# ============================================================
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-# ============================================================
-# PREDICTION API
-# ============================================================
-
-@app.route("/predict", methods=["POST"])
-def predict():
-
-    if "frame" not in request.files:
-        return jsonify({
-            "error": "No frame received."
-        }), 400
-
-    try:
-
-        # ----------------------------------------------------
-        # Read uploaded JPEG frame
-        # ----------------------------------------------------
-
-        image_bytes = request.files["frame"].read()
-
-        if not image_bytes:
-            return jsonify({
-                "error": "Empty frame."
-            }), 400
-
-        image_array = np.frombuffer(
-            image_bytes,
-            dtype=np.uint8
-        )
-
-        frame = cv2.imdecode(
-            image_array,
-            cv2.IMREAD_COLOR
-        )
-
-        if frame is None:
-            return jsonify({
-                "error": "Could not decode image."
-            }), 400
-
-
-        # ----------------------------------------------------
-        # Resize large images
-        # ----------------------------------------------------
-
-        height, width = frame.shape[:2]
-
-        if width > MAX_IMAGE_WIDTH:
-
-            scale = MAX_IMAGE_WIDTH / width
-
-            new_width = MAX_IMAGE_WIDTH
-            new_height = int(height * scale)
-
-            frame = cv2.resize(
-                frame,
-                (new_width, new_height),
-                interpolation=cv2.INTER_AREA
-            )
-
-
-        # ----------------------------------------------------
-        # Face detection
-        # ----------------------------------------------------
-
-        gray = cv2.cvtColor(
+        # Bounding box
+        cv2.rectangle(
             frame,
-            cv2.COLOR_BGR2GRAY
+            (x, y),
+            (x + w, y + h),
+            (0, 255, 0),
+            2
         )
 
-        # Detect on a smaller image for speed.
-        small_gray = cv2.resize(
-            gray,
-            None,
-            fx=0.5,
-            fy=0.5,
-            interpolation=cv2.INTER_AREA
+        # Emotion text
+        display_text = (
+            f"{label.upper()}: "
+            f"{confidence * 100:.1f}%"
         )
 
-        detected_faces = face_cascade.detectMultiScale(
-            small_gray,
-            scaleFactor=1.2,
-            minNeighbors=5,
-            minSize=(30, 30)
+        # Text background
+        text_y1 = max(0, y - 35)
+
+        cv2.rectangle(
+            frame,
+            (x, text_y1),
+            (x + w, y),
+            (0, 255, 0),
+            cv2.FILLED
         )
 
-
-        # Convert coordinates back to original image size.
-        faces = []
-
-        for x, y, w, h in detected_faces:
-
-            faces.append((
-                int(x * 2),
-                int(y * 2),
-                int(w * 2),
-                int(h * 2)
-            ))
-
-
-        # ----------------------------------------------------
-        # Prepare face crops
-        # ----------------------------------------------------
-
-        face_crops = []
-
-        for x, y, w, h in faces:
-
-            x1 = max(0, x)
-            y1 = max(0, y)
-
-            x2 = min(
-                frame.shape[1],
-                x + w
-            )
-
-            y2 = min(
-                frame.shape[0],
-                y + h
-            )
-
-            face = frame[
-                y1:y2,
-                x1:x2
-            ]
-
-            if face.size == 0:
-                continue
-
-            face_crops.append(face)
-
-
-        # ----------------------------------------------------
-        # Predict emotions
-        # ----------------------------------------------------
-
-        predictions = predict_emotions(
-            face_crops
+        # Text
+        cv2.putText(
+            frame,
+            display_text,
+            (x + 5, max(20, y - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA
         )
 
+    # OpenCV BGR -> RGB for Streamlit
+    result_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # ----------------------------------------------------
-        # Build response
-        # ----------------------------------------------------
-
-        response_faces = []
-
-        prediction_index = 0
-
-        for x, y, w, h in faces:
-
-            if prediction_index >= len(predictions):
-                break
-
-            prediction = predictions[
-                prediction_index
-            ]
-
-            response_faces.append({
-
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
-
-                "emotion": prediction[
-                    "emotion"
-                ],
-
-                "confidence": prediction[
-                    "confidence"
-                ]
-            })
-
-            prediction_index += 1
+    return result_image, detections
 
 
-        return jsonify({
+# =============================================================
+# 4. STREAMLIT INTERFACE
+# =============================================================
 
-            "faces": response_faces,
+st.title("😊 Facial Expression Recognition")
 
-            "device": str(DEVICE)
-        })
+st.markdown(
+    "Detect facial expressions using a **ViT emotion recognition model** "
+    "and OpenCV face detection."
+)
 
+st.info(
+    "For Streamlit deployment, the camera is accessed through the browser. "
+    "The server cannot use cv2.VideoCapture(0) to access your computer's webcam."
+)
 
-    except Exception as e:
+# Load models
+with st.spinner("Loading AI model..."):
+    processor, model, device = load_emotion_model()
+    face_cascade = load_face_detector()
 
-        print(
-            "Prediction error:",
-            repr(e)
+st.success(f"Model loaded successfully on: {device}")
+
+# =============================================================
+# 5. CAMERA INPUT
+# =============================================================
+
+st.subheader("📷 Camera")
+
+camera_image = st.camera_input("Take a picture")
+
+# =============================================================
+# 6. IMAGE UPLOAD
+# =============================================================
+
+st.subheader("🖼️ Or upload an image")
+
+uploaded_image = st.file_uploader(
+    "Choose an image",
+    type=["jpg", "jpeg", "png"]
+)
+
+image_source = camera_image if camera_image is not None else uploaded_image
+
+# =============================================================
+# 7. PROCESS IMAGE
+# =============================================================
+
+if image_source is not None:
+
+    image = Image.open(image_source).convert("RGB")
+
+    with st.spinner("Detecting face and emotion..."):
+        result_image, detections = detect_emotions(
+            image,
+            processor,
+            model,
+            device,
+            face_cascade
         )
 
-        return jsonify({
-            "error": str(e)
-        }), 500
+    st.subheader("🎯 Detection Result")
 
-
-# ============================================================
-# MAIN
-# ============================================================
-
-if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            5000
-        )
+    st.image(
+        result_image,
+        caption="Facial Expression Detection",
+        use_container_width=True
     )
 
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        threaded=True
+    # =========================================================
+    # DETECTION RESULTS
+    # =========================================================
+
+    if detections:
+
+        st.subheader("📊 Results")
+
+        for i, (
+            x,
+            y,
+            w,
+            h,
+            label,
+            confidence
+        ) in enumerate(detections, start=1):
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.metric("Face", i)
+
+            with col2:
+                st.metric("Emotion", label.upper())
+
+            with col3:
+                st.metric(
+                    "Confidence",
+                    f"{confidence * 100:.1f}%"
+                )
+
+    else:
+        st.warning(
+            "No face detected. Please try another image with a clear face."
+        )
+
+else:
+    st.write(
+        "📷 Take a picture with your camera or upload an image to begin."
     )
+
+# =============================================================
+# 8. SIDEBAR
+# =============================================================
+
+with st.sidebar:
+
+    st.header("About")
+
+    st.write(
+        "This application uses a Vision Transformer (ViT) model "
+        "for facial expression recognition."
+    )
+
+    st.write("**Model:**")
+    st.code(MODEL_NAME)
+
+    st.write("**Face Detector:**")
+    st.write("OpenCV Haar Cascade")
+
+    st.write("**Device:**")
+    st.write(str(device))
