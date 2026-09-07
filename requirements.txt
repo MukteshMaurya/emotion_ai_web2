@@ -1,9 +1,9 @@
-Flask>=3.0.0
-gunicorn>=22.0.0
+streamlit>=1.51.0
+streamlit-webrtc>=0.64.0
 opencv-python-headless==4.10.0.84
-torch>=2.1.0
-torchvision>=0.16.0
-transformers>=4.40.0
-Pillow>=10.0.0
 numpy==1.26.4
-urllib3>=2.0.0
+pillow
+torch
+torchvision
+transformers
+av>=15.1.0
