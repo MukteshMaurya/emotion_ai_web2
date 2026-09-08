@@ -1,9 +1,9 @@
-streamlit>=1.51.0
-streamlit-webrtc>=0.64.0
+streamlit==1.51.0
+streamlit-webrtc==0.76.2
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
-pillow
+Pillow==11.3.0
 torch
 torchvision
 transformers
-av>=15.1.0
+twilio
